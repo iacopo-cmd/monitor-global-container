@@ -10,7 +10,7 @@ Client di **Monitor Global Server** («Valutazione indipendente di VPS e connett
 - **Privacy**: per riconoscere la macchina solo impronte HMAC-SHA256 con un sale che resta qui; per la rete solo sì/no.
 - **Da container** le misure sono segnate «misura da container»: le vCPU viste possono essere un limite del container.
 
-Requisiti: python3 ≥ 3.9, curl, ping, ip; traceroute o tracepath consigliati. Il benchmark è
+Requisiti: python3 ≥ 3.9, curl, openssl. ping e ip NON servono (se mancano il client li fa in Python); traceroute o tracepath consigliati (senza, i percorsi si saltano). Il benchmark è
 [minibench.sh](https://github.com/iacopo-cmd/minibench.sh).
 
 ## Installazione e avvio (a blocchi)

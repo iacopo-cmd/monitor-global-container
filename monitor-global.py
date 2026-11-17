@@ -41,6 +41,8 @@ import json
 import os
 import re
 import shutil
+import socket
+import struct
 import subprocess
 import sys
 import time
@@ -49,7 +51,7 @@ import urllib.request
 import uuid
 from datetime import datetime, timezone
 
-VERSIONE = "0.12-mg1"
+VERSIONE = "0.12-mg2"
 CONF, CHIAVE, STATO_DIR = "/etc/monitor-global/config.env", "/etc/monitor-global/chiave", "/var/lib/monitor-global"
 QUI = os.path.dirname(os.path.realpath(__file__))
 # VERSIONE PER CONTAINER / SENZA ROOT (0.12, 17/11/2026): con MINIBENCH_DIR tutto sta in una cartella sola:
@@ -207,10 +209,73 @@ def sale():
     return bytes.fromhex(open(p).read().strip())
 
 
+# ---- rete SENZA i programmi ip e ping (0.12-mg2, 17/11/2026): nei container minimi non ci sono ----
+def mio_indirizzo(v6=False):
+    """L'indirizzo con cui la macchina esce verso Internet (UDP connect: non manda niente). None se non c'e' rotta."""
+    try:
+        with socket.socket(socket.AF_INET6 if v6 else socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("2001:4860:4860::8888" if v6 else "1.1.1.1", 53))
+            return s.getsockname()[0]
+    except OSError:
+        return None
+
+
 def scheda_principale():
-    out = subprocess.run(["ip", "-4", "route", "get", "1.1.1.1"], capture_output=True, text=True).stdout
-    m = re.search(r"\bdev (\S+)", out)
-    return m.group(1) if m else None
+    """La scheda con la rotta predefinita IPv4, da /proc/net/route (niente programma ip)."""
+    try:
+        for riga in open("/proc/net/route").read().splitlines()[1:]:
+            c = riga.split()
+            if len(c) > 7 and c[1] == "00000000" and c[7] == "00000000":
+                return c[0]
+    except OSError:
+        pass
+    return None
+
+
+def ha_ipv6_globale():
+    """Un indirizzo IPv6 globale su una scheda (da /proc/net/if_inet6: ambito 00 = globale)."""
+    try:
+        return any(r.split()[3] == "00" for r in open("/proc/net/if_inet6") if len(r.split()) > 3 and not r.startswith("00000000000000000000000000000001"))
+    except OSError:
+        return False
+
+
+def _somma(b):
+    if len(b) % 2:
+        b += b"\0"
+    s = sum(struct.unpack(f"!{len(b) // 2}H", b))
+    s = (s >> 16) + (s & 0xFFFF)
+    return ~(s + (s >> 16)) & 0xFFFF
+
+
+def ping_python(ip, v6=False, n=4, intervallo=0.5, attesa=2.0):
+    """Ping con i socket ICMP senza privilegi (net.ipv4.ping_group_range, aperto di norma nei container Docker).
+    Ritorna {seq: ms} dei ping arrivati, oppure None se il sistema non li permette."""
+    try:
+        s = socket.socket(socket.AF_INET6 if v6 else socket.AF_INET, socket.SOCK_DGRAM,
+                          socket.IPPROTO_ICMPV6 if v6 else socket.IPPROTO_ICMP)
+    except OSError:
+        return None
+    t = {}
+    with s:
+        s.settimeout(attesa)
+        for seq in range(1, n + 1):
+            corpo = struct.pack("!d", time.time()) + b"monitor-global"
+            testa = struct.pack("!BBHHH", 128 if v6 else 8, 0, 0, 0, seq)
+            pacco = testa[:2] + struct.pack("!H", 0 if v6 else _somma(testa + corpo)) + testa[4:] + corpo
+            a = T()
+            try:
+                s.sendto(pacco, (ip, 0))
+                while True:
+                    risposta = s.recv(2048)
+                    if len(risposta) >= 8 and risposta[0] == (129 if v6 else 0) and struct.unpack("!H", risposta[6:8])[0] == seq:
+                        t[seq] = (T() - a) * 1000
+                        break
+            except OSError:
+                pass
+            if seq < n:
+                time.sleep(intervallo)
+    return t
 
 
 FONTI = {
@@ -253,10 +318,11 @@ def impronte(prima: dict):
 # ---------------- 3. ping ----------------
 def ha_ipv6():
     """IPv6 che funziona davvero: una rotta verso fuori E una risposta (provato una volta per giro)."""
-    r = subprocess.run(["ip", "-6", "route", "get", "2001:4860:4860::8888"], capture_output=True, text=True)
-    if r.returncode != 0 or "unreachable" in (r.stdout + r.stderr).lower():
+    if not mio_indirizzo(v6=True):
         return False
-    return subprocess.run(["ping", "-6", "-n", "-c", "1", "-W", "2", "2001:4860:4860::8888"], capture_output=True).returncode == 0
+    if shutil.which("ping"):
+        return subprocess.run(["ping", "-6", "-n", "-c", "1", "-W", "2", "2001:4860:4860::8888"], capture_output=True).returncode == 0
+    return bool(ping_python("2001:4860:4860::8888", v6=True, n=1))
 
 
 def _ptr(ip):
@@ -270,9 +336,8 @@ def _ptr(ip):
 
 def qualita(tg):
     """Lista di controllo della rete: IPv6 (ok / indirizzo senza rotta / assente) e nomi inversi. Manda solo si/no."""
-    out = subprocess.run(["ip", "-6", "route", "get", "2001:4860:4860::8888"], capture_output=True, text=True).stdout
-    m = re.search(r"\bsrc (\S+)", out)
-    ha_indirizzo = bool(subprocess.run(["ip", "-6", "addr", "show", "scope", "global"], capture_output=True, text=True).stdout.strip())
+    src6 = mio_indirizzo(v6=True)
+    ha_indirizzo = ha_ipv6_globale()
     v6 = "ok" if ha_ipv6() else ("senza_rotta" if ha_indirizzo else "assente")
     import ipaddress
     mio4 = tg.get("tuo_ip") or ""
@@ -281,26 +346,25 @@ def qualita(tg):
     except ValueError:
         pubblico = False
     if not pubblico:                 # il server ci vede da un indirizzo interno (es. stessa macchina): uso quello con cui esco
-        o4 = subprocess.run(["ip", "-4", "route", "get", "1.1.1.1"], capture_output=True, text=True).stdout
-        m4 = re.search(r"\bsrc (\S+)", o4)
-        mio4 = m4.group(1) if m4 else ""
+        mio4 = mio_indirizzo() or ""
         try:
             pubblico = ipaddress.ip_address(mio4).is_global
         except ValueError:
             pubblico = False
     p4 = _ptr(mio4) if pubblico else None
-    p6 = _ptr(m.group(1)) if v6 == "ok" and m else None
+    p6 = _ptr(src6) if v6 == "ok" and src6 else None
     q = {"ipv6": v6, "ptr4": (p4 is not None) if pubblico else None}
     # indirizzo IPv4 della scheda con la rotta: privato = la macchina sta dietro NAT (l'IP che vede il server e' di un router,
     # e puo' cambiare senza che la macchina se ne accorga); «dynamic» = assegnato con DHCP. Si manda solo si/no.
-    o4 = subprocess.run(["ip", "-4", "route", "get", "1.1.1.1"], capture_output=True, text=True).stdout
-    s4, d4 = re.search(r"\bsrc (\S+)", o4), re.search(r"\bdev (\S+)", o4)
-    if s4:
+    src4, dev4 = mio_indirizzo(), scheda_principale()
+    if src4:
         try:
-            q["ip_nat"] = not ipaddress.ip_address(s4.group(1)).is_global
+            q["ip_nat"] = not ipaddress.ip_address(src4).is_global
         except ValueError:
             pass
-    if s4 and d4:
+    s4 = re.match(r"(.*)", src4 or "") if src4 else None
+    d4 = re.match(r"(.*)", dev4 or "") if dev4 else None
+    if s4 and d4 and shutil.which("ip"):                # DHCP si sa solo col programma ip
         riga = [l for l in subprocess.run(["ip", "-4", "-o", "addr", "show", "dev", d4.group(1)], capture_output=True, text=True).stdout.splitlines()
                 if f" {s4.group(1)}/" in l]
         if riga:
@@ -373,6 +437,9 @@ def bersagli(tg, con_v6):
 
 
 def ping(bersaglio):
+    if not shutil.which("ping"):                         # container minimo: ping in Python
+        t = ping_python(bersaglio["ip"], bersaglio["v6"]) or {}
+        return {"target_id": bersaglio["id"], "v6": bersaglio["v6"], "primo_ms": t.get(1), "altri": [t[s] for s in (2, 3, 4) if s in t]}
     out = subprocess.run(["ping", "-6" if bersaglio["v6"] else "-4", "-n", "-c", "4", "-i", "0.5", "-W", "2", bersaglio["ip"]],
                          capture_output=True, text=True, timeout=30).stdout
     t = {int(s): float(v) for s, v in re.findall(r"icmp_seq=(\d+) .*?time=([\d.]+)", out)}
@@ -507,8 +574,18 @@ def verifica(args):
         segna(ha_systemd, "systemd presente" if ha_systemd else "systemd assente: usa la versione per container (MINIBENCH_DIR)")
         segna(not cont, "non e' un container" if not cont else f"e' un CONTAINER ({cont}): usa la versione per container (MINIBENCH_DIR)")
     segna(sys.version_info >= (3, 9), f"python {sys.version.split()[0]}" + ("" if sys.version_info >= (3, 9) else ": serve 3.9 o piu' recente"))
-    mancano = [c for c in ("openssl", "ping", "findmnt", "ip") if not shutil.which(c)]
+    mancano = [c for c in ("openssl",) if not shutil.which(c)]
     segna(not mancano, "programmi necessari presenti" if not mancano else "mancano: " + ", ".join(mancano))
+    # ping e ip non sono piu' obbligatori (0.12-mg2): se mancano, il client li fa in Python
+    if not shutil.which("ping"):
+        t = ping_python("1.1.1.1", n=1)
+        segna(t is not None, "ping assente: si usa il ping in Python" + (" (provato: risponde)" if t else " (permesso, ma 1.1.1.1 non ha risposto)")
+              if t is not None else "ping assente e il ping in Python non e' permesso (net.ipv4.ping_group_range): niente misure di rete",
+              bloccante=False)
+    if not shutil.which("ip"):
+        segna(True, "programma ip assente: rotta e indirizzi letti da /proc (DHCP non rilevabile)", bloccante=False)
+    if not shutil.which("findmnt"):
+        segna(True, "findmnt assente: impronta del disco saltata", bloccante=False)
     tr = shutil.which("traceroute") or shutil.which("tracepath")
     segna(bool(tr), "traceroute presente" if tr else "traceroute assente: i percorsi non si faranno (consigliato)", bloccante=False)
     for d in ((CARTELLA,) if CARTELLA else ("/etc/monitor-global", STATO_DIR, "/opt/monitor-global")):
@@ -628,6 +705,9 @@ def fai(lavoro, conf, url, chiave, st, tg, prova):
         log(f"ping: {len(pings)} misure in {T() - a:.1f} s (IPv6: {'si' if v6 else 'no'})")
         manda("ping", url, chiave, st, {"ping": pings}, prova)
     elif lavoro == "percorsi":
+        if not (shutil.which("traceroute") or shutil.which("tracepath")):
+            log("traceroute: ne' traceroute ne' tracepath su questa macchina: percorsi saltati")
+            return
         a = T()
         v6 = ha_ipv6()
         with cf.ThreadPoolExecutor(8) as ex:

@@ -47,4 +47,6 @@ python3 -I monitor-global.py --rivendica
 - Se la verifica dice `FERMO`, fermarsi e riportare le righe con `NO`. Non modificare il codice né i percorsi.
 - Non mostrare né cancellare `stato/proprietario.txt`, `stato/sale`, `stato/id_locale`, né la chiave dopo l'iscrizione.
 
+Istruzioni passo per passo (anche per agenti): [ISTRUZIONI-AGENTE.md](ISTRUZIONI-AGENTE.md).
+
 Licenza: MIT.
